@@ -7,7 +7,7 @@ class Trade(db.Model):
     __tablename__ = 'trades'
     
     id = db.Column(db.Integer, primary_key=True)
-    symbol = db.Column(db.String(20), nullable=False)
+    symbol = db.Column(db.String(50), nullable=False)
     trade_type = db.Column(db.String(10), nullable=False)  # LONG or SHORT
     entry_price = db.Column(db.Float, nullable=False)
     exit_price = db.Column(db.Float, nullable=True)
@@ -75,10 +75,45 @@ class SignalLog(db.Model):
     __tablename__ = 'signal_logs'
     
     id = db.Column(db.Integer, primary_key=True)
-    symbol = db.Column(db.String(20), nullable=False)
+    symbol = db.Column(db.String(50), nullable=False)
     signal_type = db.Column(db.String(10), nullable=False)
     price = db.Column(db.Float, nullable=False)
     score = db.Column(db.Integer, nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.now)
     details = db.Column(db.Text, nullable=True)
     executed = db.Column(db.Boolean, default=False)
+
+class Tick(db.Model):
+    __tablename__ = 'ticks'
+
+    id = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    symbol = db.Column(db.String(50), index=True, nullable=False)
+    token = db.Column(db.String(50), index=True, nullable=True)
+    price = db.Column(db.Float, nullable=False)
+    volume = db.Column(db.Float, nullable=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'token': self.token,
+            'price': self.price,
+            'volume': self.volume,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None
+        }
+
+# Helper functions
+from sqlalchemy import desc
+
+def persist_tick(session, symbol, token, price, volume=None, timestamp=None):
+    if timestamp is None:
+        timestamp = datetime.utcnow()
+    tick = Tick(symbol=symbol, token=token, price=price, volume=volume, timestamp=timestamp)
+    session.add(tick)
+    session.commit()
+    return tick
+
+def get_recent_ticks(session, symbol_or_token, limit=100):
+    q = session.query(Tick).filter((Tick.symbol == symbol_or_token) | (Tick.token == str(symbol_or_token))).order_by(desc(Tick.timestamp)).limit(limit)
+    return [t.to_dict() for t in q]
