@@ -1,3 +1,4 @@
+import os
 import logging
 import pandas as pd
 from kiteconnect import KiteConnect, KiteTicker
@@ -16,11 +17,17 @@ class ZerodhaClient:
         self.on_close_callback = None
         self.live_data = {}
         
-        if api_key and access_token:
+        # Only attempt real connection when explicitly allowed
+        allow_real = os.getenv('ENABLE_REAL_BROKER', 'false').lower() == 'true'
+        if api_key and access_token and allow_real:
             self.connect()
     
     def connect(self):
-        """Initialize Kite Connect"""
+        """Initialize Kite Connect. Respects ENABLE_REAL_BROKER env var."""
+        if os.getenv('ENABLE_REAL_BROKER', 'false').lower() != 'true':
+            logger.info('Real broker usage disabled by ENABLE_REAL_BROKER flag; skipping Kite Connect initialization')
+            return False
+
         try:
             self.kite = KiteConnect(api_key=self.api_key)
             self.kite.set_access_token(self.access_token)
@@ -86,7 +93,21 @@ class ZerodhaClient:
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, 
                    quantity, product, order_type, price=None, trigger_price=None,
                    tag=None):
-        """Place an order"""
+        """Place an order. Respects DRY_RUN and ENABLE_REAL_BROKER flags.
+
+        Returns order_id on success or None on failure. In DRY_RUN mode returns a fake order id.
+        """
+        # Check global enable flag
+        if os.getenv('ENABLE_REAL_BROKER', 'false').lower() != 'true':
+            logger.warning('ENABLE_REAL_BROKER is not true: refusing to place real order (dry-run mode)')
+            # Return a dry-run order id to simulate success
+            return f"DRYRUN-{int(pd.Timestamp.now().timestamp())}"
+
+        # If DRY_RUN is explicitly enabled, simulate order placement
+        if os.getenv('DRY_RUN', 'true').lower() == 'true':
+            logger.info('DRY_RUN enabled: simulating order placement')
+            return f"DRYRUN-{int(pd.Timestamp.now().timestamp())}"
+
         try:
             order_params = {
                 'variety': variety,
