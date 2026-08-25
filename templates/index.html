@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC Pro Trading Bot - India</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>🏛️ SMC + Fibonacci India Pro v2</h1>
+            <div class="status-bar">
+                <span id="bot-status" class="badge stopped">STOPPED</span>
+                <span id="trading-mode" class="badge paper">PAPER TRADING</span>
+                <span id="market-status" class="badge">Market Closed</span>
+            </div>
+        </header>
+
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <button id="btn-start" class="btn btn-success">▶️ Start Bot</button>
+            <button id="btn-stop" class="btn btn-danger" disabled>⏹️ Stop Bot</button>
+            <button id="btn-refresh" class="btn btn-primary">🔄 Refresh</button>
+            <div class="capital-input">
+                <label>Initial Capital: ₹<span id="display-capital">100,000</span></label>
+            </div>
+        </div>
+
+        <!-- Portfolio Dashboard -->
+        <div class="dashboard-grid">
+            <div class="card portfolio-card">
+                <h3>💼 Portfolio</h3>
+                <div class="metric">
+                    <span class="label">Total Value</span>
+                    <span class="value" id="total-value">₹0.00</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Cash Available</span>
+                    <span class="value" id="cash">₹0.00</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Day P&L</span>
+                    <span class="value" id="day-pnl">₹0.00</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Total Returns</span>
+                    <span class="value" id="returns-pct">0.00%</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Open Positions</span>
+                    <span class="value" id="open-positions">0</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Today's Trades</span>
+                    <span class="value" id="today-trades">0/4</span>
+                </div>
+            </div>
+
+            <!-- Live Market -->
+            <div class="card market-card">
+                <h3>📊 Live Market</h3>
+                <div id="market-ticks" class="ticks-container">
+                    <p class="empty">Start bot to see live data...</p>
+                </div>
+            </div>
+
+            <!-- Open Positions -->
+            <div class="card positions-card">
+                <h3>📈 Open Positions</h3>
+                <div id="positions-list" class="list-container">
+                    <p class="empty">No open positions</p>
+                </div>
+            </div>
+
+            <!-- Recent Trades -->
+            <div class="card trades-card">
+                <h3>📋 Recent Trades</h3>
+                <div id="trades-list" class="list-container">
+                    <p class="empty">No trades yet</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Section -->
+        <div class="card chart-card">
+            <h3>📉 P&L Chart</h3>
+            <canvas id="pnl-chart"></canvas>
+        </div>
+
+        <!-- News Feed -->
+        <div class="card news-card">
+            <h3>📰 Market News <span id="sentiment-badge" class="badge neutral">NEUTRAL</span></h3>
+            <div id="news-list" class="news-container">
+                <p class="empty">Loading news...</p>
+            </div>
+        </div>
+
+        <!-- AI Assistant -->
+        <div class="card ai-card">
+            <h3>🤖 AI Trading Assistant</h3>
+            <div id="chat-history" class="chat-history"></div>
+            <div class="chat-input">
+                <input type="text" id="ai-question" placeholder="Ask about SMC strategy, risk management, Zerodha...">
+                <button id="btn-ask" class="btn btn-primary">Ask</button>
+            </div>
+        </div>
+
+        <!-- Manual Trade -->
+        <div class="card manual-trade-card">
+            <h3>⚡ Manual Trade</h3>
+            <form id="manual-trade-form">
+                <div class="form-row">
+                    <select id="manual-symbol" required>
+                        <option value="">Select Symbol</option>
+                        <option value="NIFTY 50">NIFTY 50</option>
+                        <option value="NIFTY BANK">BANKNIFTY</option>
+                        <option value="RELIANCE">RELIANCE</option>
+                        <option value="TCS">TCS</option>
+                    </select>
+                    <select id="manual-type" required>
+                        <option value="LONG">LONG</option>
+                        <option value="SHORT">SHORT</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <input type="number" id="manual-price" placeholder="Entry Price" step="0.05" required>
+                    <input type="number" id="manual-qty" placeholder="Quantity" required>
+                </div>
+                <div class="form-row">
+                    <input type="number" id="manual-sl" placeholder="Stop Loss" step="0.05" required>
+                    <input type="number" id="manual-tp1" placeholder="Target 1" step="0.05" required>
+                </div>
+                <button type="submit" class="btn btn-warning">Place Manual Order</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
