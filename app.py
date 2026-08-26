@@ -225,4 +225,46 @@ def process_strategy(symbol, token):
     except Exception as e:
         logger.error(f"Strategy processing error for {symbol}: {e}")
 
-# rest of app.py unchanged (omitted here for brevity)
+# Startup and graceful shutdown helpers
+import atexit
+
+def _start_services():
+    try:
+        init_db()
+        load_instruments()
+        # start market data provider if available
+        if hasattr(market_data, 'start'):
+            try:
+                market_data.start()
+            except Exception as e:
+                logger.info(f"market_data.start() failed: {e}")
+        # start tick persister
+        try:
+            tick_persister.start()
+        except Exception as e:
+            logger.info(f"tick_persister.start() failed: {e}")
+        logger.info("Background services started")
+    except Exception as e:
+        logger.error(f"Failed to start services: {e}")
+
+
+def _stop_services():
+    try:
+        try:
+            tick_persister.stop()
+        except Exception:
+            pass
+        if hasattr(market_data, 'stop'):
+            try:
+                market_data.stop()
+            except Exception:
+                pass
+        logger.info("Background services stopped")
+    except Exception as e:
+        logger.error(f"Error stopping services: {e}")
+
+atexit.register(_stop_services)
+
+if __name__ == '__main__':
+    _start_services()
+    socketio.run(app, host=os.getenv('HOST', '0.0.0.0'), port=int(os.getenv('PORT', 5000)), debug=(os.getenv('FLASK_DEBUG', '0') == '1'))
