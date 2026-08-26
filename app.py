@@ -11,6 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import Config
 from models import db, Trade, Portfolio, DailySummary, SignalLog
+from models.database import persist_tick, get_recent_ticks
 from strategy import SMCStrategy
 from broker import ZerodhaClient, PaperTradingEngine
 from data import MarketDataManager
@@ -42,7 +43,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 config = Config()
 zerodha = ZerodhaClient(config.ZERODHA_API_KEY, config.ZERODHA_ACCESS_TOKEN)
 paper_engine = PaperTradingEngine(config)
-market_data = MarketDataManager(zerodha)
+market_data = MarketDataManager(config=config, provider=config.MARKET_PROVIDER, zerodha_client=zerodha)
 ai_assistant = AIAssistant(config)
 news_feed = NewsFeed(config)
 
@@ -51,8 +52,8 @@ strategies = {}
 
 # Trading state
 bot_running = False
-watchlist = ['NIFTY 50', 'NIFTY BANK', 'RELIANCE', 'TCS', 'INFY']
-instrument_tokens = {}  # Will be populated from Zerodha
+watchlist = [s.strip() for s in config.WATCHLIST.split(',') if s.strip()]
+instrument_tokens = {}  # Will be populated from Zerodha or simulated tokens
 
 # Background scheduler
 scheduler = BackgroundScheduler()
@@ -65,19 +66,26 @@ def init_db():
         logger.info("Database initialized")
 
 def load_instruments():
-    """Load instrument tokens from Zerodha"""
+    """Load instrument tokens from Zerodha or create simulated tokens"""
     global instrument_tokens
     try:
-        instruments = zerodha.get_instruments('NSE')
-        if not instruments.empty:
-            # Map common symbols to tokens
-            for symbol in watchlist:
-                match = instruments[instruments['tradingsymbol'] == symbol]
-                if not match.empty:
-                    instrument_tokens[symbol] = match.iloc[0]['instrument_token']
-                    market_data.add_instrument(symbol, match.iloc[0]['instrument_token'])
-            
-            logger.info(f"Loaded {len(instrument_tokens)} instruments")
+        if zerodha and getattr(zerodha, 'kite', None):
+            instruments = zerodha.get_instruments('NSE')
+            if instruments is not None and not instruments.empty:
+                for symbol in watchlist:
+                    match = instruments[instruments['tradingsymbol'] == symbol]
+                    if not match.empty:
+                        token = match.iloc[0]['instrument_token']
+                        instrument_tokens[symbol] = token
+                        market_data.add_instrument(symbol, token, base_price=match.iloc[0].get('last_price', None))
+        else:
+            # create simple simulated tokens
+            for i, symbol in enumerate(watchlist, start=1):
+                token = f"SIM{1000 + i}"
+                instrument_tokens[symbol] = token
+                market_data.add_instrument(symbol, token, base_price=None)
+
+        logger.info(f"Loaded {len(instrument_tokens)} instruments")
     except Exception as e:
         logger.error(f"Failed to load instruments: {e}")
 
@@ -85,24 +93,31 @@ def on_ticks(ticks):
     """Handle incoming market ticks"""
     try:
         for tick in ticks:
+            # Persist tick to in-memory manager and DB
             market_data.process_tick(tick)
-            
-            token = tick['instrument_token']
+            token = tick.get('instrument_token')
+            price = tick.get('last_price') or tick.get('price')
             symbol = None
             for sym, tok in instrument_tokens.items():
-                if tok == token:
+                if str(tok) == str(token):
                     symbol = sym
                     break
-            
+            # persist to DB (non-blocking could be improved)
+            try:
+                persist_tick(db.session, symbol or str(token), token, price, volume=tick.get('volume_traded') or tick.get('volume'), timestamp=None)
+            except Exception:
+                # DB persistence best-effort
+                logger.debug('Failed to persist tick to DB')
+
             if symbol and bot_running:
                 process_strategy(symbol, token)
-        
+
         # Emit to frontend
         socketio.emit('market_tick', {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.utcnow().isoformat(),
             'ticks': [{k: v for k, v in tick.items() if k != 'depth'} for tick in ticks]
         })
-        
+
     except Exception as e:
         logger.error(f"Error processing ticks: {e}")
 
@@ -112,59 +127,59 @@ def process_strategy(symbol, token):
         # Get dataframes
         df_5m = market_data.get_dataframe(token, '5minute', 100)
         df_15m = market_data.get_dataframe(token, '15minute', 100)
-        
-        if df_5m.empty or len(df_5m) < 50:
+
+        if df_5m.empty or len(df_5m) < 10:
             return
-        
+
         # Get or create strategy instance
         if symbol not in strategies:
             strategies[symbol] = SMCStrategy(config)
-        
+
         strategy = strategies[symbol]
-        
+
         # Get portfolio value
         portfolio = paper_engine.get_portfolio_summary()
-        current_equity = portfolio['total_value']
-        
+        current_equity = portfolio.get('total_value', 0)
+
         # Analyze for signal
         signal = strategy.analyze(df_5m, df_15m, current_equity)
-        
+
         if signal:
             logger.info(f"Signal generated: {signal['type']} {symbol} @ {signal['price']}")
-            
+
             # Log signal
             signal_log = SignalLog(
                 symbol=symbol,
                 signal_type=signal['type'],
                 price=signal['price'],
-                score=signal['score'],
-                details=json.dumps(signal['details']),
+                score=signal.get('score', 0),
+                details=json.dumps(signal.get('details', {})),
                 executed=False
             )
             db.session.add(signal_log)
             db.session.commit()
-            
+
             # Execute paper trade
             if config.PAPER_TRADING:
                 trade = paper_engine.execute_entry(signal, is_paper=True)
                 if trade:
                     signal_log.executed = True
                     db.session.commit()
-                    
+
                     socketio.emit('new_trade', {
                         'trade': trade.to_dict(),
                         'signal': signal
                     })
-            
+
             # Execute live trade
-            elif config.LIVE_TRADING and zerodha.kite:
+            elif config.LIVE_TRADING and getattr(zerodha, 'kite', None):
                 # Place order via Zerodha
                 variety = 'regular'
                 exchange = 'NSE'
                 transaction_type = 'BUY' if signal['type'] == 'LONG' else 'SELL'
                 order_type = 'MARKET'
                 product = 'MIS'  # Intraday
-                
+
                 order_id = zerodha.place_order(
                     variety=variety,
                     exchange=exchange,
@@ -175,11 +190,11 @@ def process_strategy(symbol, token):
                     order_type=order_type,
                     tag='SMC_BOT'
                 )
-                
+
                 if order_id:
                     signal_log.executed = True
                     db.session.commit()
-                    
+
                     # Place SL order
                     sl_transaction = 'SELL' if signal['type'] == 'LONG' else 'BUY'
                     zerodha.place_order(
@@ -194,10 +209,10 @@ def process_strategy(symbol, token):
                         trigger_price=signal['stop_loss'],
                         tag='SMC_BOT_SL'
                     )
-        
+
         # Check open positions for exits
         check_position_exits(symbol, token, strategy)
-        
+
     except Exception as e:
         logger.error(f"Strategy processing error for {symbol}: {e}")
 
@@ -205,15 +220,15 @@ def check_position_exits(symbol, token, strategy):
     """Check and manage open positions"""
     try:
         open_positions = paper_engine.get_open_positions()
-        
+
         for trade in open_positions:
             if trade.symbol != symbol:
                 continue
-            
+
             latest_price = market_data.get_latest_price(token)
             if not latest_price:
                 continue
-            
+
             # Check stop loss
             if paper_engine.check_stop_loss(trade, latest_price):
                 paper_engine.execute_exit(trade.id, latest_price, 'STOP_LOSS')
@@ -223,50 +238,50 @@ def check_position_exits(symbol, token, strategy):
                     'reason': 'STOP_LOSS'
                 })
                 continue
-            
+
             # Check TP1
             if trade.status == 'OPEN' and paper_engine.check_take_profit(trade, latest_price, 1):
                 # Close 50% position
                 exit_qty = trade.quantity // 2
                 paper_engine.execute_exit(trade.id, latest_price, 'TP1', exit_qty)
-                
+
                 # Move SL to breakeven
                 trade.stop_loss = trade.entry_price
                 db.session.commit()
-                
+
                 socketio.emit('trade_update', {
                     'trade_id': trade.id,
                     'event': 'TP1_HIT',
                     'price': latest_price
                 })
                 continue
-            
+
             # Check TP2
             if trade.status == 'PARTIAL' and paper_engine.check_take_profit(trade, latest_price, 2):
                 # Close 30% of original position (60% of remaining)
                 remaining = trade.quantity
                 exit_qty = int(remaining * 0.6)
                 paper_engine.execute_exit(trade.id, latest_price, 'TP2', exit_qty)
-                
+
                 socketio.emit('trade_update', {
                     'trade_id': trade.id,
                     'event': 'TP2_HIT',
                     'price': latest_price
                 })
                 continue
-            
+
             # Check trailing stop
             position = {
                 'type': trade.trade_type,
                 'entry_price': trade.entry_price,
                 'risk_distance': trade.entry_price - trade.stop_loss if trade.trade_type == 'LONG' else trade.stop_loss - trade.entry_price
             }
-            
+
             trail_stop = strategy.update_trailing_stop(
                 market_data.get_dataframe(token, '5minute', 50),
                 position
             )
-            
+
             if trail_stop:
                 if trade.trade_type == 'LONG' and latest_price <= trail_stop:
                     paper_engine.execute_exit(trade.id, latest_price, 'TRAIL_STOP')
@@ -282,7 +297,7 @@ def check_position_exits(symbol, token, strategy):
                         'exit_price': latest_price,
                         'reason': 'TRAIL_STOP'
                     })
-    
+
     except Exception as e:
         logger.error(f"Position exit check error: {e}")
 
@@ -291,15 +306,15 @@ def scheduled_tasks():
     try:
         # Update daily summary
         paper_engine.update_daily_summary()
-        
+
         # Emit portfolio update
         portfolio = paper_engine.get_portfolio_summary()
         socketio.emit('portfolio_update', portfolio)
-        
+
         # Emit news update
         news = news_feed.get_market_news(limit=5)
         socketio.emit('news_update', news)
-        
+
     except Exception as e:
         logger.error(f"Scheduled task error: {e}")
 
@@ -309,21 +324,55 @@ def index():
     """Main dashboard"""
     return render_template('index.html')
 
+@app.route('/market')
+def market_page():
+    return render_template('market.html')
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({'status': 'ok', 'time': datetime.utcnow().isoformat()})
+
 @app.route('/api/portfolio')
 def api_portfolio():
     """Get portfolio summary"""
     return jsonify(paper_engine.get_portfolio_summary())
+
+@app.route('/api/market/latest')
+def api_market_latest():
+    symbol = request.args.get('symbol')
+    token = request.args.get('token')
+    if token:
+        price = market_data.get_latest_price(token)
+        return jsonify({'token': token, 'price': price})
+    if symbol:
+        # try to map symbol to token
+        tok = instrument_tokens.get(symbol)
+        if tok:
+            price = market_data.get_latest_price(tok)
+            return jsonify({'symbol': symbol, 'token': tok, 'price': price})
+    return jsonify({'error': 'symbol or token required'}), 400
+
+@app.route('/api/market/history')
+def api_market_history():
+    symbol = request.args.get('symbol')
+    token = request.args.get('token')
+    limit = int(request.args.get('limit', 100))
+    if symbol or token:
+        key = symbol if symbol else token
+        rows = get_recent_ticks(db.session, key, limit=limit)
+        return jsonify({'items': rows})
+    return jsonify({'error': 'symbol or token required'}), 400
 
 @app.route('/api/trades')
 def api_trades():
     """Get trade history"""
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
-    
+
     trades = Trade.query.order_by(Trade.entry_time.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
-    
+
     return jsonify({
         'trades': [t.to_dict() for t in trades.items],
         'total': trades.total,
@@ -367,17 +416,17 @@ def api_ask():
     """Ask AI assistant"""
     data = request.json
     question = data.get('question', '')
-    
+
     # Get current portfolio context
     portfolio = paper_engine.get_portfolio_summary()
     open_positions = paper_engine.get_open_positions()
-    
+
     context = {
         'portfolio': portfolio,
         'open_positions': [p.to_dict() for p in open_positions],
         'mode': 'PAPER' if config.PAPER_TRADING else 'LIVE'
     }
-    
+
     answer = ai_assistant.ask(question, context)
     return jsonify({'answer': answer})
 
@@ -385,20 +434,17 @@ def api_ask():
 def api_bot_start():
     """Start the trading bot"""
     global bot_running
-    
-    if not zerodha.kite:
+
+    # If live trading is requested, ensure zerodha connection
+    if config.LIVE_TRADING and not getattr(zerodha, 'kite', None):
         return jsonify({'error': 'Zerodha not connected'}), 400
-    
+
     if not instrument_tokens:
         load_instruments()
-    
-    # Subscribe to instruments
-    tokens = list(instrument_tokens.values())
-    zerodha.subscribe(tokens)
-    
+
     bot_running = True
     logger.info("Trading bot started")
-    
+
     return jsonify({'status': 'started', 'symbols': list(instrument_tokens.keys())})
 
 @app.route('/api/bot/stop', methods=['POST'])
@@ -406,11 +452,12 @@ def api_bot_stop():
     """Stop the trading bot"""
     global bot_running
     bot_running = False
-    
-    # Unsubscribe from instruments
+
+    # Unsubscribe from instruments (if using real provider)
     tokens = list(instrument_tokens.values())
-    zerodha.unsubscribe(tokens)
-    
+    if getattr(zerodha, 'kite', None):
+        zerodha.unsubscribe(tokens)
+
     logger.info("Trading bot stopped")
     return jsonify({'status': 'stopped'})
 
@@ -421,7 +468,8 @@ def api_bot_status():
         'running': bot_running,
         'mode': 'PAPER' if config.PAPER_TRADING else 'LIVE',
         'watchlist': list(instrument_tokens.keys()),
-        'zerodha_connected': zerodha.kite is not None
+        'zerodha_connected': getattr(zerodha, 'kite', None) is not None,
+        'market_provider': config.MARKET_PROVIDER
     })
 
 @app.route('/api/settings', methods=['GET', 'POST'])
@@ -438,7 +486,7 @@ def api_settings():
             'paper_trading': config.PAPER_TRADING,
             'live_trading': config.LIVE_TRADING
         })
-    
+
     elif request.method == 'POST':
         data = request.json
         # Note: In production, persist to database or config file
@@ -448,7 +496,7 @@ def api_settings():
 def api_manual_trade():
     """Place manual trade"""
     data = request.json
-    
+
     signal = {
         'symbol': data.get('symbol'),
         'type': data.get('type', 'LONG'),
@@ -458,24 +506,24 @@ def api_manual_trade():
         'take_profit_1': data.get('take_profit_1'),
         'take_profit_2': data.get('take_profit_2'),
         'take_profit_3': data.get('take_profit_3'),
-        'risk_distance': abs(data.get('price') - data.get('stop_loss')),
+        'risk_distance': abs(data.get('price') - data.get('stop_loss')) if data.get('price') and data.get('stop_loss') else None,
         'score': 10,  # Manual override
         'is_continuation': False,
         'strategy': 'MANUAL'
     }
-    
+
     if config.PAPER_TRADING:
         trade = paper_engine.execute_entry(signal, is_paper=True)
         if trade:
             return jsonify({'status': 'success', 'trade': trade.to_dict()})
-    
+
     return jsonify({'error': 'Failed to execute trade'}), 400
 
 # WebSocket events
 @socketio.on('connect')
 def handle_connect():
     logger.info("Client connected")
-    emit('connected', {'status': 'connected', 'timestamp': datetime.now().isoformat()})
+    emit('connected', {'status': 'connected', 'timestamp': datetime.utcnow().isoformat()})
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -484,28 +532,37 @@ def handle_disconnect():
 # Initialize
 with app.app_context():
     init_db()
-    
+
     # Start scheduler
     scheduler.add_job(scheduled_tasks, 'interval', seconds=30, id='portfolio_update')
     scheduler.start()
-    
-    # Try to connect to Zerodha if credentials available
-    if config.ZERODHA_API_KEY and config.ZERODHA_ACCESS_TOKEN:
-        zerodha.connect()
-        if zerodha.kite:
-            # Start WebSocket in background
-            def start_ws():
-                zerodha.start_websocket(
-                    config.ZERODHA_API_KEY,
-                    config.ZERODHA_ACCESS_TOKEN,
-                    on_ticks
-                )
-            
-            ws_thread = Thread(target=start_ws)
-            ws_thread.daemon = True
-            ws_thread.start()
-            
-            logger.info("WebSocket started")
+
+    # Load instruments
+    load_instruments()
+
+    # Start market data
+    market_data.start()
+
+    # Try to connect to Zerodha if credentials available and live trading enabled
+    if config.ZERODHA_API_KEY and config.ZERODHA_ACCESS_TOKEN and config.LIVE_TRADING:
+        try:
+            zerodha.connect()
+            if getattr(zerodha, 'kite', None):
+                # Start WebSocket in background
+                def start_ws():
+                    zerodha.start_websocket(
+                        config.ZERODHA_API_KEY,
+                        config.ZERODHA_ACCESS_TOKEN,
+                        on_ticks
+                    )
+
+                ws_thread = Thread(target=start_ws)
+                ws_thread.daemon = True
+                ws_thread.start()
+
+                logger.info("Zerodha WebSocket started")
+        except Exception as e:
+            logger.error(f"Zerodha connection failed: {e}")
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=config.PORT, debug=False)
