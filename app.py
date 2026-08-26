@@ -1,11 +1,133 @@
-@@
--from config import Config
-+from config import Config
-@@
--zerodha = ZerodhaClient(config.ZERODHA_API_KEY, config.ZERODHA_ACCESS_TOKEN)
--paper_engine = PaperTradingEngine(config)
--market_data = MarketDataManager(config=config, provider=config.MARKET_PROVIDER, zerodha_client=zerodha)
-+zerodha = ZerodhaClient(config.ZERODHA_API_KEY, config.ZERODHA_ACCESS_TOKEN)
-+paper_engine = PaperTradingEngine(config)
-+# Construct MarketDataManager with matching signature
-+market_data = MarketDataManager(zerodha_client=zerodha, provider=config.MARKET_PROVIDER, api_key=config.MARKET_API_KEY)
+import os
+import logging
+import json
+from datetime import datetime, timedelta
+from threading import Thread
+import time
+
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from config import Config
+from models import db, Trade, Portfolio, DailySummary, SignalLog
+from models.database import persist_tick, get_recent_ticks
+from strategy import SMCStrategy
+from broker import ZerodhaClient, PaperTradingEngine
+from data import MarketDataManager
+from ai import AIAssistant
+from news import NewsFeed
+from services.tick_persister import TickPersister
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app
+app = Flask(__name__)
+app.config.from_object(Config)
+app.config['SQLALCHEMY_DATABASE_URI'] = Config.DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize extensions
+db.init_app(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Global instances
+config = Config()
+zerodha = ZerodhaClient(config.ZERODHA_API_KEY, config.ZERODHA_ACCESS_TOKEN)
+paper_engine = PaperTradingEngine(config)
+# Construct MarketDataManager with matching signature
+market_data = MarketDataManager(zerodha_client=zerodha, provider=config.MARKET_PROVIDER, api_key=config.MARKET_API_KEY)
+ai_assistant = AIAssistant(config)
+news_feed = NewsFeed(config)
+
+# Strategy instances per symbol
+strategies = {}
+
+# Trading state
+bot_running = False
+watchlist = [s.strip() for s in config.WATCHLIST.split(',') if s.strip()]
+instrument_tokens = {}  # Will be populated from Zerodha or simulated tokens
+
+# Background scheduler
+scheduler = BackgroundScheduler()
+
+# Tick persister (buffered DB writes)
+tick_persister = TickPersister(app, flush_interval=1.0, batch_size=200)
+
+def init_db():
+    """Initialize database tables"""
+    with app.app_context():
+        db.create_all()
+        paper_engine.setup_portfolio()
+        logger.info("Database initialized")
+
+def load_instruments():
+    """Load instrument tokens from Zerodha or create simulated tokens"""
+    global instrument_tokens
+    try:
+        if zerodha and getattr(zerodha, 'kite', None):
+            instruments = zerodha.get_instruments('NSE')
+            if instruments is not None and not instruments.empty:
+                for symbol in watchlist:
+                    match = instruments[instruments['tradingsymbol'] == symbol]
+                    if not match.empty:
+                        token = match.iloc[0]['instrument_token']
+                        instrument_tokens[symbol] = token
+                        market_data.add_instrument(symbol, token, base_price=match.iloc[0].get('last_price', None))
+        else:
+            # create simple simulated tokens
+            for i, symbol in enumerate(watchlist, start=1):
+                token = f"SIM{1000 + i}"
+                instrument_tokens[symbol] = token
+                market_data.add_instrument(symbol, token, base_price=None)
+
+        logger.info(f"Loaded {len(instrument_tokens)} instruments")
+    except Exception as e:
+        logger.error(f"Failed to load instruments: {e}")
+
+def on_ticks(ticks):
+    """Handle incoming market ticks"""
+    try:
+        for tick in ticks:
+            # Persist tick to in-memory manager and DB (batched)
+            market_data.process_tick(tick)
+            token = tick.get('instrument_token')
+            price = tick.get('last_price') or tick.get('price')
+            symbol = None
+            for sym, tok in instrument_tokens.items():
+                if str(tok) == str(token):
+                    symbol = sym
+                    break
+
+            # Enqueue to batched persister (non-blocking)
+            try:
+                tick_persister.enqueue(symbol or str(token), token, price, volume=tick.get('volume_traded') or tick.get('volume'), timestamp=None)
+            except Exception:
+                # Fallback to direct DB persist if persister fails
+                try:
+                    persist_tick(db.session, symbol or str(token), token, price, volume=tick.get('volume_traded') or tick.get('volume'), timestamp=None)
+                except Exception:
+                    logger.debug('Failed to persist tick to DB')
+
+            if symbol and bot_running:
+                process_strategy(symbol, token)
+
+        # Emit to frontend
+        socketio.emit('market_tick', {
+            'timestamp': datetime.utcnow().isoformat(),
+            'ticks': [{k: v for k, v in tick.items() if k != 'depth'} for tick in ticks]
+        })
+
+    except Exception as e:
+        logger.error(f"Error processing ticks: {e}")
+
+# rest of app.py unchanged (omitted here for brevity)
