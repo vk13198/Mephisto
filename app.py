@@ -130,4 +130,99 @@ def on_ticks(ticks):
     except Exception as e:
         logger.error(f"Error processing ticks: {e}")
 
+def process_strategy(symbol, token):
+    """Process strategy for a symbol"""
+    try:
+        # Get dataframes
+        df_5m = market_data.get_dataframe(token, '5minute', 100)
+        df_15m = market_data.get_dataframe(token, '15minute', 100)
+
+        if df_5m.empty or len(df_5m) < 10:
+            return
+
+        # Get or create strategy instance
+        if symbol not in strategies:
+            strategies[symbol] = SMCStrategy(config)
+
+        strategy = strategies[symbol]
+
+        # Get portfolio value
+        portfolio = paper_engine.get_portfolio_summary()
+        current_equity = portfolio.get('total_value', 0)
+
+        # Analyze for signal
+        signal = strategy.analyze(df_5m, df_15m, current_equity)
+
+        if signal:
+            logger.info(f"Signal generated: {signal['type']} {symbol} @ {signal['price']}")
+
+            # Log signal
+            signal_log = SignalLog(
+                symbol=symbol,
+                signal_type=signal['type'],
+                price=signal['price'],
+                score=signal.get('score', 0),
+                details=json.dumps(signal.get('details', {})),
+                executed=False
+            )
+            db.session.add(signal_log)
+            db.session.commit()
+
+            # Execute paper trade
+            if config.PAPER_TRADING:
+                trade = paper_engine.execute_entry(signal, is_paper=True)
+                if trade:
+                    signal_log.executed = True
+                    db.session.commit()
+
+                    socketio.emit('new_trade', {
+                        'trade': trade.to_dict(),
+                        'signal': signal
+                    })
+
+            # Execute live trade
+            elif config.LIVE_TRADING and getattr(zerodha, 'kite', None):
+                # Place order via Zerodha
+                variety = 'regular'
+                exchange = 'NSE'
+                transaction_type = 'BUY' if signal['type'] == 'LONG' else 'SELL'
+                order_type = 'MARKET'
+                product = 'MIS'  # Intraday
+
+                order_id = zerodha.place_order(
+                    variety=variety,
+                    exchange=exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=signal['quantity'],
+                    product=product,
+                    order_type=order_type,
+                    tag='SMC_BOT'
+                )
+
+                if order_id:
+                    signal_log.executed = True
+                    db.session.commit()
+
+                    # Place SL order
+                    sl_transaction = 'SELL' if signal['type'] == 'LONG' else 'BUY'
+                    zerodha.place_order(
+                        variety='regular',
+                        exchange='NSE',
+                        tradingsymbol=symbol,
+                        transaction_type=sl_transaction,
+                        quantity=signal['quantity'],
+                        product='MIS',
+                        order_type='SL',
+                        price=signal['stop_loss'],
+                        trigger_price=signal['stop_loss'],
+                        tag='SMC_BOT_SL'
+                    )
+
+        # Check open positions for exits
+        check_position_exits(symbol, token, strategy)
+
+    except Exception as e:
+        logger.error(f"Strategy processing error for {symbol}: {e}")
+
 # rest of app.py unchanged (omitted here for brevity)
