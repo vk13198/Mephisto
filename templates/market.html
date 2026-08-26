@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mephisto Market</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+  </head>
+  <body>
+    <h1>Market</h1>
+    <div>
+      <label for="symbol">Symbol:</label>
+      <select id="symbol"></select>
+      <button id="subscribe">Subscribe</button>
+      <button id="unsubscribe">Unsubscribe</button>
+    </div>
+    <canvas id="chart" width="800" height="300"></canvas>
+    <script src="/static/js/market.js"></script>
+  </body>
+</html>
